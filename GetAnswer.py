@@ -1,90 +1,134 @@
-# GetAnswer_Refactored.py (파일 이름 변경 또는 기존 파일 수정)
-
+# GetAnswer.py (RAG + 페르소나 적용)
 import os
-# --- 필요한 라이브러리 임포트 ---
-# (기존 GetAnswer.py와 동일하게 모든 import 구문 포함)
-from langchain_community.document_loaders import CSVLoader
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain.chains import RetrievalQA
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-# (SpeakAnswer, tts_styles 등 다른 필요한 모듈도 import)
-try:
-    from SpeakAnswer_Bytes import generate_tts_audio # TTS 함수가 바이트를 반환하도록 수정되었다고 가정
-    from tts_styles import get_available_styles, get_style_params
-except ImportError:
-    print("Warning: SpeakAnswer_Bytes 또는 tts_styles 모듈 임포트 실패")
-    # 임시 대체 함수/데이터 (Streamlit에서 직접 임포트할 것이므로 여기선 필수 아님)
-    def generate_tts_audio(text, style): return None
-    def get_available_styles(): return {"default": "기본"}
+from langchain.chains import ConversationalRetrievalChain
+from langchain_community.document_loaders.csv_loader import CSVLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.memory import ConversationBufferMemory
+from langchain.prompts import PromptTemplate, ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate # 프롬프트 템플릿 추가
 
 # --- 설정 ---
-CSV_FILE_PATH = r"C:\Users\skku07\Documents\GitHub\OneDayAI\dummy_basketball.csv"
-# (API 키 설정 등 필요시 포함)
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "YOUR_API_KEY_HERE")
+_CSV_FILE_PATH = r"C:\Users\skku07\Documents\GitHub\OneDayAI\dummy_basketball.csv" # 내부 관리
+_FAISS_INDEX_PATH = "faiss_index_baseball_persona" # 인덱스 경로 (필요시 재생성)
 
-# --- 핵심 기능 함수화 ---
+# --- 내부 헬퍼 함수 (변경 없음) ---
+def _create_or_load_vectorstore(file_path, index_path):
+    # ... (이전과 동일한 코드) ...
+    embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
+    if os.path.exists(index_path):
+        print(f"기존 인덱스 로드: {index_path}")
+        try:
+             # allow_dangerous_deserialization=True 추가 (FAISS 최신 버전 호환성)
+             return FAISS.load_local(index_path, embeddings, allow_dangerous_deserialization=True)
+        except Exception as e:
+             print(f"인덱스 로드 실패 ({e}), 새 인덱스 생성 시도...")
+             # 실패 시 인덱스 삭제하고 재생성 (선택적)
+             # import shutil
+             # shutil.rmtree(index_path, ignore_errors=True)
+             # return _create_or_load_vectorstore(file_path, index_path) # 재귀 호출보다는 아래 로직으로 진행
 
-# QA 시스템 초기화 함수
-def initialize_qa_system(csv_path=CSV_FILE_PATH):
-    """CSV 로드, 벡터화, QA 체인 생성을 수행하고 QA 체인을 반환합니다."""
-    print(f"QA 시스템 초기화 시작 (데이터: {csv_path})...") # 콘솔 로그 (디버깅용)
-    # (기존 GetAnswer.py의 초기화 로직: loader, docs, splitter, embeddings, vectorstore, retriever, llm 생성)
-    # --- 이 부분은 이전 GetAnswer.py의 초기화 코드와 동일 ---
-    if not os.path.exists(csv_path):
-        print(f"오류: CSV 파일 없음 - {csv_path}")
-        return None
-    loader = CSVLoader(file_path=csv_path, encoding="utf-8")
-    docs = loader.load()
-    if not docs:
-        print("오류: CSV 데이터 로드 실패")
-        return None
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    split_docs = text_splitter.split_documents(docs)
-    embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-    vectorstore = FAISS.from_documents(split_docs, embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={'k': 3})
-    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo", openai_api_key=OPENAI_API_KEY)
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm, chain_type="stuff", retriever=retriever
-    )
-    # --- 초기화 코드 끝 ---
-    print("QA 시스템 초기화 완료.")
-    return qa_chain # 생성된 QA 체인 객체를 반환
+    print(f"'{file_path}'에서 새 인덱스 생성 중...")
+    loader = CSVLoader(file_path=file_path, encoding='utf-8-sig') # UTF-8-SIG 시도
+    documents = loader.load()
+    if not documents:
+        raise ValueError(f"CSV 파일 '{file_path}'에서 문서를 로드하지 못했습니다.")
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    texts = text_splitter.split_documents(documents)
+    if not texts:
+         raise ValueError("문서를 청크로 분할하지 못했습니다.")
+    vectorstore = FAISS.from_documents(texts, embeddings)
+    vectorstore.save_local(index_path)
+    print(f"새 인덱스 저장 완료: {index_path}")
+    return vectorstore
 
-# 질문으로 답변을 얻는 함수
-def get_answer(qa_chain, query):
-    """주어진 QA 체인과 질문으로 답변 텍스트를 얻어 반환합니다."""
-    if not qa_chain:
-        return "오류: QA 시스템이 초기화되지 않았습니다."
+
+# --- 공개 인터페이스 함수 ---
+def initialize_qa_system(character_system_prompt="You are a helpful assistant."):
+    """
+    CSV 데이터와 캐릭터 페르소나를 기반으로 QA 시스템을 초기화합니다.
+    character_system_prompt 인자를 받아 페르소나를 적용합니다.
+    """
+    print(f"QA 시스템 초기화 시작 (데이터 경로: {_CSV_FILE_PATH})")
+    print(f"적용될 페르소나: {character_system_prompt[:100]}...") # 페르소나 확인용 로그
+
     try:
-        print(f"질문 처리 중: {query}") # 콘솔 로그
-        result = qa_chain({"query": query})
-        answer = result.get('result', '죄송합니다, 답변을 찾지 못했습니다.')
-        print(f"답변 생성됨: {answer[:50]}...") # 콘솔 로그
-        return answer
+        if not os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY") == "YOUR_API_KEY_HERE":
+             raise ValueError("OpenAI API 키가 설정되지 않았거나 유효하지 않습니다.")
+
+        vectorstore = _create_or_load_vectorstore(_CSV_FILE_PATH, _FAISS_INDEX_PATH)
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True, output_key='answer') # output_key 명시
+
+        llm = ChatOpenAI(temperature=0.7, model_name='gpt-3.5-turbo') # 온도는 여기서 조절하거나 app.py에서 전달
+
+        # --- 페르소나 적용을 위한 프롬프트 템플릿 수정 ---
+        # CONDENSE_QUESTION_PROMPT는 기본값을 사용하거나 필요시 수정
+        # QA_PROMPT를 수정하여 시스템 프롬프트를 주입
+        _template = f"""
+{character_system_prompt}
+
+Use the following pieces of context from CSV data and the chat history to answer the question at the end.
+If you don't know the answer from the context, just say that you don't have information about that in the provided data, don't try to make up an answer.
+If the question is conversational and not directly answerable from the context, answer it naturally based on your persona and the chat history.
+
+Context:
+{{context}}
+
+Chat History:
+{{chat_history}}
+
+Question: {{question}}
+Answer:"""
+
+        QA_PROMPT = PromptTemplate(
+            template=_template, input_variables=["context", "chat_history", "question"]
+        )
+        # -------------------------------------------------
+
+        # combine_docs_chain_kwargs를 사용하여 사용자 정의 프롬프트 전달
+        qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=vectorstore.as_retriever(),
+            memory=memory,
+            return_source_documents=False, # 필요시 True로 변경
+            combine_docs_chain_kwargs={"prompt": QA_PROMPT}, # 수정된 QA 프롬프트 적용!
+            verbose=False # 디버깅 시 True로 변경
+        )
+        print("페르소나 적용 QA 시스템 초기화 성공")
+        return qa_chain
+
     except Exception as e:
-        print(f"답변 생성 오류: {e}") # 콘솔 로그
-        return f"답변 생성 중 오류 발생: {e}"
+        print(f"QA 시스템 초기화 중 오류 발생: {e}")
+        # raise # 필요시 오류를 다시 발생시켜 app.py에서 처리
+        return None # 실패 시 None 반환
 
-# --- 스크립트로 직접 실행 시 동작할 부분 ---
-if __name__ == "__main__":
-    # 이 블록은 GetAnswer_Refactored.py를 직접 python GetAnswer_Refactored.py 처럼
-    # 실행했을 때만 동작하고, 다른 파일에서 import 할 때는 실행되지 않습니다.
-    print("GetAnswer 모듈 직접 실행 모드 (테스트용)")
+def get_answer(chain, query):
+    """주어진 QA 체인(페르소나 적용됨)과 질문을 사용하여 답변을 생성합니다."""
+    if not chain:
+        return "오류: QA 시스템이 준비되지 않았습니다."
+    try:
+        print(f"QA Chain 호출: Query='{query}'")
+        result = chain.invoke({"question": query}) # invoke 사용 (권장)
+        print(f"QA Chain 결과: {result}")
+        # result 딕셔너리 구조 확인 필요 (Langchain 버전에 따라 다를 수 있음)
+        answer = result.get("answer", "답변을 찾을 수 없습니다.")
+        # 가끔 결과가 이중 딕셔너리일 수 있음
+        if isinstance(answer, dict):
+             answer = answer.get("answer", "답변 형식 오류")
 
-    # 시스템 초기화
-    my_qa_chain = initialize_qa_system()
+        # 답변 앞뒤 공백 제거
+        return answer.strip() if answer else "빈 답변이 반환되었습니다."
 
-    if my_qa_chain:
-        # 기존의 while 루프 (명령줄 인터페이스)를 여기에 넣어서 테스트 가능
-        print("\n명령줄 테스트 인터페이스 시작 (종료: '종료')")
-        while True:
-            user_query = input("테스트 질문 입력 > ")
-            if user_query.lower() == "종료":
-                break
-            response = get_answer(my_qa_chain, user_query)
-            print(f"봇 응답: {response}")
-            # 필요시 여기서 speak_text 테스트 호출 가능
+    except Exception as e:
+        print(f"답변 생성 중 오류 발생 (get_answer): {e}")
+        import traceback
+        traceback.print_exc() # 상세 오류 출력
+        # 사용자에겐 간단한 메시지 전달
+        return f"답변 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+
+def get_data_source_description():
+    """데이터 소스 설명을 반환합니다 (변경 없음)."""
+    if os.path.exists(_CSV_FILE_PATH):
+        return f"'{os.path.basename(_CSV_FILE_PATH)}' 데이터 기반"
     else:
-        print("QA 시스템 초기화 실패로 테스트 인터페이스를 시작할 수 없습니다.")
+        return "CSV 데이터 기반 (파일 경로 확인 필요)"
